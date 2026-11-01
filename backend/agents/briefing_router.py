@@ -1,0 +1,329 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from database import get_db
+from models import Article, UserProfile
+from agents.graph import pipeline
+from pydantic import BaseModel
+from typing import Optional, List
+import json
+import logging
+from collections import Counter
+from llm import chat_completion_result
+from fetcher import search_external_articles
+
+logger = logging.getLogger("et_news.briefing")
+
+router = APIRouter()
+
+class BriefingRequest(BaseModel):
+    user_id: str = "demo_user"
+    query: Optional[str] = None
+    article_ids: Optional[List[str]] = None
+
+class BriefingResponse(BaseModel):
+    briefing: str
+    sources_used: List[str]
+    ranked_count: int
+    pipeline_steps: List[str] = ["enrichment", "ranking", "synthesis"]
+    degraded: bool = False
+    complete: bool = True
+    truncated: bool = False
+    notice: Optional[str] = None
+
+
+INCOMPLETE_BRIEFING_NOTICE = (
+    "The AI stopped before this briefing was finished, so some sections may "
+    "be missing. The reporting above is unchanged."
+)
+
+@router.post("/", response_model=BriefingResponse)
+def generate_briefing(
+    request: BriefingRequest,
+    db: Session = Depends(get_db)
+):
+    if request.article_ids:
+        primary = db.query(Article).filter(
+            Article.id.in_(request.article_ids)
+        ).all()
+        if primary:
+            category = primary[0].category
+            related = db.query(Article).filter(
+                Article.category == category,
+                Article.id.notin_(request.article_ids)
+            ).order_by(
+                Article.published_at.desc()
+            ).limit(6).all()
+            articles = primary + related
+        else:
+            articles = db.query(Article).order_by(
+                Article.published_at.desc()
+            ).limit(15).all()
+    else:
+        articles = db.query(Article).order_by(
+            Article.published_at.desc()
+        ).limit(15).all()
+    
+    profile = db.query(UserProfile).filter(
+        UserProfile.user_id == request.user_id
+    ).first()
+    
+    user_profile = {}
+    if profile:
+        user_profile = {
+            "category_weights": profile.category_weights or {},
+            "topic_preferences": profile.entity_interests or [],
+            "entity_interests": profile.entity_interests or [],
+        }
+    
+    articles_dicts = []
+    requested_ids = set(request.article_ids or [])
+    for a in articles:
+        entities = a.entities
+        if isinstance(entities, str):
+            try:
+                entities = json.loads(entities)
+            except Exception:
+                entities = []
+        # Full text is only needed for the article(s) the reader asked about;
+        # related stories stay summary-sized to keep the prompt bounded.
+        include_content = a.id in requested_ids or not (a.summary or "").strip()
+        articles_dicts.append({
+            "id": a.id,
+            "headline": a.headline,
+            "summary": a.summary or "",
+            "content": (a.content or "") if include_content else "",
+            "source": a.source,
+            "category": a.category,
+            "sentiment_label": a.sentiment_label or "neutral",
+            "entities": entities,
+        })
+    
+    result = pipeline.invoke({
+        "articles": articles_dicts,
+        "user_profile": user_profile,
+        "query": request.query or "",
+        "enriched_articles": [],
+        "ranked_articles": [],
+        "briefing": None,
+        "sources_used": [],
+        "error": None,
+        "briefing_error": None,
+        "briefing_complete": True,
+        "briefing_truncated": False,
+        "briefing_recovered": False,
+        "focus_article_id": (
+            request.article_ids[0] if request.article_ids else None
+        ),
+    })
+    
+    briefing_error = result.get("briefing_error")
+    complete = bool(result.get("briefing_complete", True))
+    truncated = bool(result.get("briefing_truncated", False))
+    return BriefingResponse(
+        briefing=result["briefing"],
+        sources_used=result["sources_used"],
+        ranked_count=len(result["ranked_articles"]),
+        degraded=bool(briefing_error),
+        complete=complete,
+        truncated=truncated,
+        notice=(
+            INCOMPLETE_BRIEFING_NOTICE
+            if (not complete and not briefing_error)
+            else None
+        ),
+    )
+
+class TopicBriefingRequest(BaseModel):
+    topic: str
+    user_id: str = "demo_user"
+
+class AngleBriefing(BaseModel):
+    angle: str
+    content: str
+    article_count: int
+
+class TopicBriefingResponse(BaseModel):
+    topic: str
+    total_articles: int
+    angles: List[AngleBriefing]
+    key_entities: List[str]
+    sentiment_summary: str
+    what_to_watch: str
+    article_ids: List[str]
+
+@router.post("/topic", response_model=TopicBriefingResponse)
+def generate_topic_briefing(
+    request: TopicBriefingRequest,
+    db: Session = Depends(get_db)
+):
+    from sqlalchemy import or_
+    topic_lower = request.topic.lower()
+    
+    all_articles = db.query(Article).order_by(
+        Article.published_at.desc()
+    ).limit(50).all()
+    
+    related = []
+    for a in all_articles:
+        text = f"{a.headline} {a.summary or ''}".lower()
+        if topic_lower in text or any(
+            word in text 
+            for word in topic_lower.split()
+            if len(word) > 3
+        ):
+            related.append(a)
+    
+    if len(related) < 5:
+        # We need more context, so search the web (NewsAPI /everything)
+        from routers.feed import upsert_articles
+        external = search_external_articles(request.topic, limit=12)
+        if external:
+            upsert_articles(external, db)
+            # Re-fetch related with the new articles
+            all_articles = db.query(Article).order_by(
+                Article.published_at.desc()
+            ).limit(100).all()
+            related = []
+            for a in all_articles:
+                text = f"{a.headline} {a.summary or ''}".lower()
+                if topic_lower in text or any(word in text for word in topic_lower.split() if len(word) > 3):
+                    related.append(a)
+    
+    # Final fallback if still empty
+    if not related:
+        related = db.query(Article).order_by(Article.published_at.desc()).limit(10).all()
+    
+    articles_text = ""
+    article_ids = []
+    all_entities = []
+    sentiments = []
+    
+    for i, a in enumerate(related[:12], 1):
+        entities = a.entities
+        if isinstance(entities, str):
+            try:
+                entities = json.loads(entities)
+            except Exception:
+                entities = []
+        all_entities.extend(entities)
+        sentiments.append(a.sentiment_label or "neutral")
+        article_ids.append(a.id)
+        articles_text += f"""
+Article {i} [{a.source}] [{a.category}] [{a.sentiment_label}]:
+{a.headline}
+{a.summary or ''}
+---"""
+    
+    entity_counts = Counter(all_entities)
+    top_entities = [e for e, _ in entity_counts.most_common(8)]
+    
+    pos = sentiments.count("positive")
+    neg = sentiments.count("negative")
+    if pos > neg:
+        sentiment_summary = f"Overall positive sentiment ({pos}/{len(sentiments)} articles bullish)"
+    elif neg > pos:
+        sentiment_summary = f"Mixed to negative sentiment ({neg}/{len(sentiments)} articles cautious)"
+    else:
+        sentiment_summary = f"Neutral sentiment across {len(sentiments)} articles"
+    
+    prompt = f"""You are analyzing {len(related)} articles about "{request.topic}" for Indian business news readers.
+Some of these articles are sourced from broad web intelligence to provide a complete picture.
+
+{articles_text}
+
+Create a structured intelligence briefing with EXACTLY these 4 angles. Each angle must draw from DIFFERENT articles and perspectives — no overlapping content.
+
+Return ONLY a JSON object with this exact structure:
+{{
+  "macro_impact": "2-3 sentences on the big picture economic/policy impact. Cite specific sources.",
+  "market_reaction": "2-3 sentences on how markets/stocks/investors are responding. Cite specific numbers if available.",
+  "expert_view": "2-3 sentences on what analysts and experts are saying. Cite specific names/sources.",
+  "what_to_watch": "2-3 sentences on the key developments to monitor going forward."
+}}
+
+Rules:
+- Each section must be distinct, no repeated information
+- Always cite the source publication by name
+- Be specific, not generic
+- If an angle has no relevant data, say so briefly"""
+
+    result = chat_completion_result(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an expert Indian financial analyst. Return only valid JSON, no markdown, no backticks."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5,
+        max_tokens=1600,
+    )
+
+    if result.truncated:
+        # The JSON contract cannot tolerate a half-written object. One compact
+        # regeneration is cheaper than guessing which fields survived.
+        logger.warning("Topic briefing hit the output limit; retrying compactly")
+        result = chat_completion_result(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert Indian financial analyst. Return only valid JSON, no markdown, no backticks."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                    + "\n\nReturn a shorter but COMPLETE JSON object. Keep each value "
+                    "to one or two sentences and close every brace.",
+                },
+            ],
+            temperature=0.5,
+            max_tokens=1000,
+        )
+
+    raw = result.content.replace("```json", "").replace("```", "").strip()
+    
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        logger.warning(
+            "Topic briefing returned unparseable JSON (topic_length=%d, finish_reason=%s)",
+            len(request.topic),
+            result.finish_reason,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The AI service returned an unreadable briefing. Please try again.",
+        ) from exc
+    
+    angles = [
+        AngleBriefing(
+            angle="Macro Impact",
+            content=parsed.get("macro_impact", ""),
+            article_count=len(related)
+        ),
+        AngleBriefing(
+            angle="Market Reaction", 
+            content=parsed.get("market_reaction", ""),
+            article_count=len(related)
+        ),
+        AngleBriefing(
+            angle="Expert View",
+            content=parsed.get("expert_view", ""),
+            article_count=len(related)
+        ),
+        AngleBriefing(
+            angle="What to Watch",
+            content=parsed.get("what_to_watch", ""),
+            article_count=len(related)
+        ),
+    ]
+    
+    return TopicBriefingResponse(
+        topic=request.topic,
+        total_articles=len(related),
+        angles=angles,
+        key_entities=top_entities,
+        sentiment_summary=sentiment_summary,
+        what_to_watch=parsed.get("what_to_watch", ""),
+        article_ids=article_ids,
+    )
