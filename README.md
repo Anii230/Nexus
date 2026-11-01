@@ -6,13 +6,6 @@
 
 NEXUS is an AI-powered news intelligence platform for exploring news, uncovering connections, comparing perspectives, and understanding developing stories with NLP-powered analysis.
 
-Built for Avataar.ai × Economic Times Hackathon 2026 (Track 8).
-
-Submission by Avataar.ai × Economic Times, March 2026.
-
-> "Business news in 2026 is still delivered like it's 2005 — static text articles, one-size-fits-all homepage, same format for everyone. Build something that makes people say 'I can't go back to reading news the old way.'"
-> — PS-8 Problem Statement
-
 ---
 
 ## Overview
